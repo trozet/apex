@@ -31,11 +31,13 @@ function setup_instack_vm {
       #virsh vol-create default instack.qcow2.xml
       virsh define instack.xml
 
-      #Copy instack machine
-      cp instack.qcow2 /var/lib/libvirt/images
-      restorecon /var/lib/libvirt/images/instack.qcow2
+      #Upload instack image
+      #virsh vol-create default --file instack.qcow2.xml
+      virsh vol-create-as default instack.qcow2 30G --format qcow2
+      virsh vol-upload --pool default --vol instack.qcow2 --file instack.qcow2
 
-      sleep 1
+      sleep 1 # this was to let the copy settle, needed with vol-upload?
+
       virsh start instack
   else
       echo "Found Instack VM, using existing VM"
@@ -45,14 +47,14 @@ function setup_instack_vm {
 
   CNT=10
   echo -n "Waiting for instack's dhcp address"
-  while ! virsh net-dhcp-leases default | grep instack > /dev/null && [ $CNT -gt 0 ]; do
+  while ! grep instack /var/lib/libvirt/dnsmasq/default.leases > /dev/null && [ $CNT -gt 0 ]; do
       echo -n "."
       sleep 3
       CNT=CNT-1
   done
 
   # get the instack VM IP
-  UNDERCLOUD=$(virsh net-dhcp-leases default | grep instack | awk '{print $5}' | awk -F '/' '{print $1}')
+  UNDERCLOUD=$(grep instack /var/lib/libvirt/dnsmasq/default.leases | awk '{print $3}')
 
   CNT=10
   echo -en "\rValidating instack VM connectivity"
@@ -62,7 +64,7 @@ function setup_instack_vm {
       CNT=CNT-1
   done
   CNT=10
-  while ! ssh -T -o "StrictHostKeyChecking no" root@$UNDERCLOUD "echo ''" 1>&2> /dev/null && [ $CNT -gt 0 ]; do
+  while ! ssh -T -o "StrictHostKeyChecking no" "root@$UNDERCLOUD" "echo ''" 2>&1> /dev/null && [ $CNT -gt 0 ]; do
       echo -n "."
       sleep 3
       CNT=CNT-1
@@ -72,40 +74,69 @@ function setup_instack_vm {
   echo -e "\rInstack VM has IP $UNDERCLOUD                                    "
 
   #ssh -T -o "StrictHostKeyChecking no" root@$UNDERCLOUD "systemctl stop openstack-nova-compute.service"
-  ssh -T -o "StrictHostKeyChecking no" root@$UNDERCLOUD "ip a a 192.0.2.1/24 dev eth1"
+  #ssh -T -o "StrictHostKeyChecking no" root@$UNDERCLOUD "ip a a 192.0.2.1/24 dev eth1"
+  ssh -T -o "StrictHostKeyChecking no" root@$UNDERCLOUD "if ! ip a s eth1 | grep 192.0.2.1; then ip a a 192.0.2.1/24 dev eth1; fi"
+}
+
+function setup_virtual_baremetal {
+  for i in 0 1; do
+    if ! virsh list | grep baremetal_${i} > /dev/null; then
+      virsh define baremetal_${i}.xml
+      virsh vol-create-as default baremetal_${i}.qcow2 40G --format qcow2
+    fi
+  done
 }
 
 ##Copy over the glance images and instack json file
 ##params: none 
 function copy_materials {
 
-  scp stack/deploy-ramdisk-ironic.initramfs stack@$UNDERCLOUD:
-  scp stack/deploy-ramdisk-ironic.kernel stack@$UNDERCLOUD:
-  scp stack/discovery-ramdisk.initramfs stack@$UNDERCLOUD:
-  scp stack/discovery-ramdisk.kernel stack@$UNDERCLOUD:
-  scp stack/fedora-user.qcow2 stack@$UNDERCLOUD:
-  scp stack/overcloud-full.initrd stack@$UNDERCLOUD:
-  scp stack/overcloud-full.qcow2 stack@$UNDERCLOUD:
-  scp stack/overcloud-full.vmlinuz stack@$UNDERCLOUD:
+  scp -o "StrictHostKeyChecking no" stack/deploy-ramdisk-ironic.initramfs "stack@$UNDERCLOUD":
+  scp -o "StrictHostKeyChecking no" stack/deploy-ramdisk-ironic.kernel "stack@$UNDERCLOUD":
+  scp -o "StrictHostKeyChecking no" stack/discovery-ramdisk.initramfs "stack@$UNDERCLOUD":
+  scp -o "StrictHostKeyChecking no" stack/discovery-ramdisk.kernel "stack@$UNDERCLOUD":
+  scp -o "StrictHostKeyChecking no" stack/fedora-user.qcow2 "stack@$UNDERCLOUD":
+  scp -o "StrictHostKeyChecking no" stack/overcloud-full.initrd "stack@$UNDERCLOUD":
+  scp -o "StrictHostKeyChecking no" stack/overcloud-full.qcow2 "stack@$UNDERCLOUD":
+  scp -o "StrictHostKeyChecking no" stack/overcloud-full.vmlinuz "stack@$UNDERCLOUD":
 
-  scp instackenv.json stack@$UNDERCLOUD:
+  if [ $virtual == "TRUE" ]; then
+      scp instackenv-virt.json "stack@$UNDERCLOUD":instackenv.json
+  else
+      scp instackenv.json "stack@$UNDERCLOUD":
+  fi
 }
 
-##Seed the undercloud openstack installation
 ##preping it for deployment and launch the deploy
 ##params: none 
 function undercloud_prep_overcloud_deploy {
-  ssh -T -o "StrictHostKeyChecking no" stack@$UNDERCLOUD <<EOI
+
+### TODO: REMOVE THIS HACK
+### RDO manager is not setting this parameter.
+### once RDO manager does set it properly we can remove this ssh call
+  ssh -T -o "StrictHostKeyChecking no" "root@$UNDERCLOUD" <<EOI
+if ! grep -e "^service_plugins" /etc/neutron/neutron.conf; then
+    openstack-config --set /etc/neutron/neutron.conf DEFAULT service_plugins "neutron.services.l3_router.l3_router_plugin.L3RouterPlugin,neutron.services.metering.metering_plugin.MeteringPlugin"
+    service neutron-server restart
+    echo "WARNING: updated /etc/neutron/neutron.conf DEFAULT service_plugins"
+fi
+EOI
+
+  ssh -T -o "StrictHostKeyChecking no" "stack@$UNDERCLOUD" <<EOI
 source stackrc
-echo "Configuring undercloud and discovering nodes"
+echo "Uploading overcloud glance images"
 openstack overcloud image upload
+echo "Configuring undercloud and discovering nodes"
 openstack baremetal import --json instackenv.json
 openstack baremetal configure boot
 openstack baremetal introspection bulk start
+echo "Configuring flavors"
 openstack flavor create --id auto --ram 4096 --disk 40 --vcpus 1 baremetal
 openstack flavor set --property "cpu_arch"="x86_64" --property "capabilities:boot_option"="local" baremetal
-neutron subnet-update $(neutron subnet-list | grep -v id | grep -v \\-\\- | awk {'print $2'}) --dns-nameserver 8.8.8.8
-openstack overcloud deploy --plan overcloud
+echo "Configuring nameserver on ctlplane network"
+neutron subnet-update \$(neutron subnet-list | grep -v id | grep -v \\\\-\\\\- | awk {'print \$2'}) --dns-nameserver 8.8.8.8
+echo "Executing overcloud deployment"
+openstack overcloud deploy --templates
 EOI
 
 }
@@ -200,6 +231,9 @@ parse_cmdline() {
 main() {
   parse_cmdline "$@"
   setup_instack_vm
+  if [ $virtual == "TRUE" ]; then
+    setup_virtual_baremetal
+  fi
   copy_materials
   undercloud_prep_overcloud_deploy
 }
